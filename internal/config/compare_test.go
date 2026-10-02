@@ -449,6 +449,168 @@ func TestServiceConfigEqual(t *testing.T) {
 	}
 }
 
+func TestGlobalEqual(t *testing.T) {
+	t.Run("empty globals are equal", func(t *testing.T) {
+		assert.True(t, GlobalEqual(Global{}, Global{}))
+	})
+
+	t.Run("identical global sections are equal", func(t *testing.T) {
+		d := 5 * time.Second
+		enabled := true
+		size := int64(1024)
+		a := Global{
+			MetricsAddr:              ":9090",
+			TrustedProxies:           []string{"10.0.0.0/8", "1.2.3.4"},
+			AccessLog:                &enabled,
+			MaxRequestBodySize:       &size,
+			DialTimeout:              &d,
+			MetricsReadHeaderTimeout: &d,
+		}
+		b := a
+		assert.True(t, GlobalEqual(a, b))
+	})
+
+	t.Run("metrics addr differs", func(t *testing.T) {
+		assert.False(t, GlobalEqual(Global{MetricsAddr: ":9090"}, Global{MetricsAddr: ":9091"}))
+	})
+
+	t.Run("trusted proxies differ in content", func(t *testing.T) {
+		assert.False(t, GlobalEqual(
+			Global{TrustedProxies: []string{"10.0.0.0/8"}},
+			Global{TrustedProxies: []string{"10.1.0.0/16"}},
+		))
+	})
+
+	t.Run("trusted proxies differ in order", func(t *testing.T) {
+		// Order is significant because it is operator-authored configuration.
+		assert.False(t, GlobalEqual(
+			Global{TrustedProxies: []string{"10.0.0.0/8", "1.2.3.4"}},
+			Global{TrustedProxies: []string{"1.2.3.4", "10.0.0.0/8"}},
+		))
+	})
+
+	t.Run("scalar pointer values differ", func(t *testing.T) {
+		short := time.Second
+		long := 2 * time.Second
+		assert.False(t, GlobalEqual(Global{DialTimeout: &short}, Global{DialTimeout: &long}))
+		assert.False(t, GlobalEqual(Global{DialTimeout: &short}, Global{}))
+		assert.False(t, GlobalEqual(Global{}, Global{DialTimeout: &long}))
+	})
+}
+
+func TestServiceShapeEqual(t *testing.T) {
+	base := func() Service {
+		return Service{
+			Name:        "api",
+			BackendAddr: "http://localhost:8080",
+			TLSMode:     "auto",
+		}
+	}
+
+	t.Run("identical services are shape equal", func(t *testing.T) {
+		assert.True(t, ServiceShapeEqual(base(), base()))
+	})
+
+	t.Run("inherited field changes are ignored", func(t *testing.T) {
+		a := base()
+		b := base()
+		timeout := 5 * time.Second
+		enabled := true
+		disabled := false
+		size := int64(1024)
+		a.StartupTimeout = &timeout
+		a.ReadHeaderTimeout = &timeout
+		a.WriteTimeout = &timeout
+		a.IdleTimeout = &timeout
+		a.ResponseHeaderTimeout = &timeout
+		a.AccessLog = &enabled
+		a.FlushInterval = &timeout
+		a.MaxRequestBodySize = &size
+
+		b.AccessLog = &disabled
+		b.MaxRequestBodySize = nil
+		assert.True(t, ServiceShapeEqual(a, b),
+			"changes to globally inherited fields must not count as a service shape change")
+	})
+
+	t.Run("backend change changes the shape", func(t *testing.T) {
+		a := base()
+		b := base()
+		b.BackendAddr = "http://localhost:9090"
+		assert.False(t, ServiceShapeEqual(a, b))
+	})
+
+	t.Run("non-inherited per-service timeout still changes shape", func(t *testing.T) {
+		a := base()
+		b := base()
+		d1 := time.Second
+		d2 := 2 * time.Second
+		a.WhoisTimeout = &d1
+		b.WhoisTimeout = &d2
+		assert.False(t, ServiceShapeEqual(a, b))
+	})
+}
+
+func TestServicesShapeEqual(t *testing.T) {
+	t.Run("same services with different inherited values", func(t *testing.T) {
+		enabled := true
+		a := []Service{{
+			Name:      "api",
+			AccessLog: &enabled,
+		}}
+		b := []Service{{
+			Name: "api",
+		}}
+		assert.True(t, ServicesShapeEqual(a, b))
+		assert.False(t, ServicesEqual(a, b), "full equality must still detect the inherited value difference")
+	})
+
+	t.Run("service added", func(t *testing.T) {
+		a := []Service{{Name: "api"}}
+		b := []Service{{Name: "api"}, {Name: "web"}}
+		assert.False(t, ServicesShapeEqual(a, b))
+	})
+
+	t.Run("order independent", func(t *testing.T) {
+		a := []Service{{Name: "api"}, {Name: "web"}}
+		b := []Service{{Name: "web"}, {Name: "api"}}
+		assert.True(t, ServicesShapeEqual(a, b))
+		assert.True(t, ServicesEqual(a, b))
+	})
+}
+
+func TestEqual(t *testing.T) {
+	t.Run("nil handling", func(t *testing.T) {
+		assert.True(t, Equal(nil, nil))
+		assert.False(t, Equal(nil, &Config{}))
+		assert.False(t, Equal(&Config{}, nil))
+	})
+
+	t.Run("global-only difference is not equal", func(t *testing.T) {
+		a := &Config{
+			Global:   Global{MetricsAddr: ":9090"},
+			Services: []Service{{Name: "api"}},
+		}
+		b := &Config{
+			Global:   Global{MetricsAddr: ":9091"},
+			Services: []Service{{Name: "api"}},
+		}
+		assert.False(t, Equal(a, b))
+	})
+
+	t.Run("identical normalized configs are equal", func(t *testing.T) {
+		a := &Config{
+			Global:   Global{MetricsAddr: ":9090"},
+			Services: []Service{{Name: "api"}, {Name: "web"}},
+		}
+		b := &Config{
+			Global:   Global{MetricsAddr: ":9090"},
+			Services: []Service{{Name: "web"}, {Name: "api"}},
+		}
+		assert.True(t, Equal(a, b))
+	})
+}
+
 // durationPtrEqual compares two time.Duration pointers
 func durationPtrEqual(a, b *time.Duration) bool {
 	if a == nil && b == nil {

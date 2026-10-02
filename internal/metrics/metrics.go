@@ -4,6 +4,7 @@ package metrics
 import (
 	"bufio"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -288,23 +289,29 @@ func NewServer(addr string, registry *prometheus.Registry, readHeaderTimeout tim
 	}
 }
 
-// Start starts the metrics server
-func (s *Server) Start(ctx context.Context) error {
-	// Create prometheus handler
-	handler := promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{})
+// Listen binds the TCP listener and prepares the HTTP server without
+// accepting connections. It lets a configuration generation verify that a
+// new metrics address is bindable before any running resource is touched.
+// Call Serve to start accepting traffic, or Discard to release a candidate
+// that never entered service.
+func (s *Server) Listen() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.listener != nil {
+		return errors.NewResourceError(fmt.Sprintf("metrics server already listening on %s", s.addr))
+	}
 
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return errors.WrapResource(err, fmt.Sprintf("failed to listen on %s", s.addr))
 	}
-
-	// Set listener with lock
-	s.mu.Lock()
 	s.listener = listener
-	s.mu.Unlock()
 
-	// Create server
+	// Create prometheus handler
+	handler := promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{})
+
 	timeout := s.readHeaderTimeout
 	if timeout == 0 {
 		timeout = 5 * time.Second // Default if not set
@@ -314,15 +321,54 @@ func (s *Server) Start(ctx context.Context) error {
 		ReadHeaderTimeout: timeout,
 	}
 
+	return nil
+}
+
+// Serve starts accepting connections on the listener created by Listen.
+func (s *Server) Serve() {
+	s.mu.RLock()
+	listener := s.listener
+	server := s.server
+	s.mu.RUnlock()
+
+	if listener == nil || server == nil {
+		slog.Error("metrics server called Serve before Listen", "address", s.addr)
+		return
+	}
+
 	// Start serving in background
 	go func() {
-		if err := s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			// Log error but don't crash
 			slog.Error("metrics server error", "error", err)
 		}
 	}()
+}
 
+// Start binds the listener and starts the metrics server.
+func (s *Server) Start(ctx context.Context) error {
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	s.Serve()
 	return nil
+}
+
+// Discard releases a candidate metrics server that was bound with Listen but
+// never published via Serve. After Discard the server no longer holds its
+// port and Shutdown is a no-op.
+func (s *Server) Discard() {
+	s.mu.Lock()
+	listener := s.listener
+	s.listener = nil
+	s.server = nil
+	s.mu.Unlock()
+
+	if listener != nil {
+		if err := listener.Close(); err != nil && !stderrors.Is(err, net.ErrClosed) {
+			slog.Debug("error closing discarded metrics listener", "error", err)
+		}
+	}
 }
 
 // Addr returns the actual address the server is listening on

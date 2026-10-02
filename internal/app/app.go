@@ -19,15 +19,17 @@ import (
 
 // App encapsulates the tsbridge application lifecycle
 type App struct {
-	cfg           *config.Config
-	provider      config.Provider
-	tsServer      *tailscale.Server
-	registry      *service.Registry
-	metricsServer *metrics.Server
-	startOnce     sync.Once
-	stopOnce      sync.Once
-	configWatcher context.CancelFunc
-	mu            sync.RWMutex
+	cfg             *config.Config
+	provider        config.Provider
+	providerName    string
+	tsServer        *tailscale.Server
+	registry        *service.Registry
+	metricsServer   *metrics.Server
+	metricsRegistry *prometheus.Registry
+	startOnce       sync.Once
+	stopOnce        sync.Once
+	configWatcher   context.CancelFunc
+	mu              sync.RWMutex
 }
 
 // Options allows customizing App creation for testing
@@ -44,22 +46,20 @@ func NewApp(cfg *config.Config) (*App, error) {
 
 // NewAppWithOptions creates a new App instance with custom options
 func NewAppWithOptions(cfg *config.Config, opts Options) (*App, error) {
+	providerName := "file"
 	if opts.Provider != nil {
 		loaded, err := opts.Provider.Load(context.Background())
 		if err != nil {
 			return nil, tserrors.WrapConfig(err, "failed to load config from provider")
 		}
 		cfg = loaded
+		providerName = opts.Provider.Name()
 	}
 
 	if cfg == nil {
 		return nil, tserrors.NewValidationError("config cannot be nil")
 	}
 
-	providerName := ""
-	if opts.Provider != nil {
-		providerName = opts.Provider.Name()
-	}
 	if err := cfg.Validate(providerName); err != nil {
 		// The error from Validate is already a validation error
 		return nil, err
@@ -81,10 +81,11 @@ func NewAppWithOptions(cfg *config.Config, opts Options) (*App, error) {
 	}
 
 	app := &App{
-		cfg:      cfg,
-		provider: opts.Provider,
-		tsServer: tsServer,
-		registry: registry,
+		cfg:          cfg,
+		provider:     opts.Provider,
+		providerName: providerName,
+		tsServer:     tsServer,
+		registry:     registry,
 	}
 
 	if cfg.Global.MetricsAddr != "" {
@@ -100,9 +101,31 @@ func NewAppWithOptions(cfg *config.Config, opts Options) (*App, error) {
 	return app, nil
 }
 
-// setupMetrics initializes the metrics server and collector
+// setupMetrics initializes the metrics collector and server (server is not
+// started until Start).
 func (a *App) setupMetrics() error {
 	slog.Debug("creating metrics collector")
+	reg, err := a.ensureMetricsRegistry()
+	if err != nil {
+		return err
+	}
+
+	// Create metrics server (but don't start it yet)
+	a.metricsServer = metrics.NewServer(a.cfg.Global.MetricsAddr, reg, metricsReadHeaderTimeout(a.cfg))
+
+	return nil
+}
+
+// ensureMetricsRegistry creates (once) the Prometheus registry, collector and
+// default runtime collectors and wires the collector into the service
+// registry. It is shared by startup metrics and by a later configuration
+// generation that enables metrics at runtime, so metric series are
+// continuous across metrics_addr migrations.
+func (a *App) ensureMetricsRegistry() (*prometheus.Registry, error) {
+	if a.metricsRegistry != nil {
+		return a.metricsRegistry, nil
+	}
+
 	collector := metrics.NewCollector()
 	reg := prometheus.NewRegistry()
 
@@ -111,19 +134,21 @@ func (a *App) setupMetrics() error {
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	if err := collector.Register(reg); err != nil {
-		return tserrors.WrapResource(err, "failed to register metrics")
+		return nil, tserrors.WrapResource(err, "failed to register metrics")
 	}
 
 	a.registry.SetMetricsCollector(collector)
+	a.metricsRegistry = reg
+	return reg, nil
+}
 
-	// Create metrics server (but don't start it yet)
-	var metricsTimeout time.Duration
-	if a.cfg.Global.MetricsReadHeaderTimeout != nil {
-		metricsTimeout = *a.cfg.Global.MetricsReadHeaderTimeout
+// metricsReadHeaderTimeout resolves the metrics server read-header timeout,
+// applying the same default the metrics server uses when the value is unset.
+func metricsReadHeaderTimeout(cfg *config.Config) time.Duration {
+	if cfg.Global.MetricsReadHeaderTimeout != nil {
+		return *cfg.Global.MetricsReadHeaderTimeout
 	}
-	a.metricsServer = metrics.NewServer(a.cfg.Global.MetricsAddr, reg, metricsTimeout)
-
-	return nil
+	return 5 * time.Second
 }
 
 // Start starts the application and all its services
@@ -143,13 +168,13 @@ func (a *App) Start(ctx context.Context) error {
 			}
 		}
 
-		if a.metricsServer != nil {
+		if current := a.currentMetricsServer(); current != nil {
 			slog.Debug("starting metrics server", "address", a.cfg.Global.MetricsAddr)
-			if err := a.metricsServer.Start(ctx); err != nil {
+			if err := current.Start(ctx); err != nil {
 				startErr = tserrors.WrapResource(err, "failed to start metrics server")
 				return
 			}
-			slog.Info("metrics server listening", "address", a.metricsServer.Addr())
+			slog.Info("metrics server listening", "address", current.Addr())
 		}
 
 		slog.Info("starting services")
@@ -167,8 +192,8 @@ func (a *App) Start(ctx context.Context) error {
 				// All services failed or other error type
 				startErr = err
 				// If all services fail, shut down metrics server
-				if a.metricsServer != nil {
-					if shutdownErr := a.metricsServer.Shutdown(context.Background()); shutdownErr != nil {
+				if metricsServer := a.currentMetricsServer(); metricsServer != nil {
+					if shutdownErr := metricsServer.Shutdown(context.Background()); shutdownErr != nil {
 						slog.Error("failed to shutdown metrics server", "error", shutdownErr)
 					}
 				}
@@ -203,8 +228,8 @@ func (a *App) performShutdown(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
-	if a.metricsServer != nil {
-		if err := a.metricsServer.Shutdown(ctx); err != nil {
+	if metricsServer := a.currentMetricsServer(); metricsServer != nil {
+		if err := metricsServer.Shutdown(ctx); err != nil {
 			slog.Error("failed to shutdown metrics server", "error", err)
 			errs = append(errs, tserrors.WrapInternal(err, "failed to shutdown metrics server"))
 		}
@@ -247,8 +272,21 @@ func (a *App) watchConfigChanges(ctx context.Context, configCh <-chan *config.Co
 	}
 }
 
-// ReloadConfig reloads the configuration and restarts affected services
-// This method is exported for testing purposes
+// ReloadConfig applies a new configuration to the running process.
+//
+// Updates are serialized on the App lock. Three outcomes are possible:
+//   - The candidate is identical to the current configuration: no-op.
+//   - Only the service set changed (add/remove/update): the existing dynamic
+//     service management path is used.
+//   - The global section changed: the candidate is parsed and validated
+//     before any runtime resource is touched, then every running service's
+//     handler generation and the Prometheus listener switch over together as
+//     one atomic generation. On any preparation failure the candidate is
+//     discarded in full, the previous generation keeps serving, and the
+//     current config is left untouched; the same candidate can be retried
+//     once the fault clears.
+//
+// This method is exported for testing purposes.
 func (a *App) ReloadConfig(newCfg *config.Config) error {
 	start := time.Now()
 
@@ -256,19 +294,56 @@ func (a *App) ReloadConfig(newCfg *config.Config) error {
 	defer a.mu.Unlock()
 
 	oldCfg := a.cfg
-	err := reloadConfigWithRegistry(oldCfg, newCfg, a.registry)
 
-	if a.registry != nil {
-		if collector := a.registry.GetMetricsCollector(); collector != nil {
-			collector.RecordConfigReload(err == nil, time.Since(start))
-		}
+	// Parse/validate the candidate completely before touching runtime resources.
+	if newCfg == nil {
+		err := tserrors.NewValidationError("config cannot be nil")
+		a.recordConfigReload(false, time.Since(start))
+		return err
+	}
+	if err := newCfg.Validate(a.providerName); err != nil {
+		a.recordConfigReload(false, time.Since(start))
+		return err
 	}
 
-	// Always update the config, even if some operations failed
-	// This ensures we're working with the latest intended configuration
-	a.cfg = newCfg
+	globalChanged := !config.GlobalEqual(oldCfg.Global, newCfg.Global)
 
-	return err
+	var reloadErr error
+	switch {
+	case globalChanged:
+		reloadErr = a.applyGlobalGeneration(oldCfg, newCfg)
+	case config.ServicesEqual(oldCfg.Services, newCfg.Services):
+		slog.Debug("configuration unchanged, skipping reload")
+	default:
+		// Service-only change: add/remove/update through the dynamic path.
+		reloadErr = reloadConfigWithRegistry(oldCfg, newCfg, a.registry)
+	}
+
+	a.recordConfigReload(reloadErr == nil, time.Since(start))
+
+	if globalChanged {
+		// Publish the candidate as current only after the whole generation
+		// committed. A failed generation must never be remembered as current.
+		if reloadErr == nil {
+			a.cfg = newCfg
+		}
+		return reloadErr
+	}
+
+	// Dynamic path keeps its existing semantics: it tolerates per-operation
+	// failures and the latest intended configuration is published either way.
+	a.cfg = newCfg
+	return reloadErr
+}
+
+// recordConfigReload records the reload outcome on the active collector, if any.
+func (a *App) recordConfigReload(success bool, duration time.Duration) {
+	if a.registry == nil {
+		return
+	}
+	if collector := a.registry.GetMetricsCollector(); collector != nil {
+		collector.RecordConfigReload(success, duration)
+	}
 }
 
 // findServicesToRemove returns names of services in old config not present in new config.
@@ -324,8 +399,9 @@ func findServicesToUpdate(old, new *config.Config) []config.Service {
 // MetricsAddr returns the actual address the metrics server is listening on.
 // Returns empty string if metrics server is not running.
 func (a *App) MetricsAddr() string {
-	if a.metricsServer == nil {
+	metricsServer := a.currentMetricsServer()
+	if metricsServer == nil {
 		return ""
 	}
-	return a.metricsServer.Addr()
+	return metricsServer.Addr()
 }

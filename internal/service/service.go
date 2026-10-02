@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jtdowney/tsbridge/internal/config"
@@ -48,7 +49,30 @@ type Service struct {
 	server           *http.Server
 	tsServer         *tailscale.Server // Reference to Tailscale server for WhoIs
 	metricsCollector *metrics.Collector
-	handler          http.Handler // Pre-created handler to catch config errors early
+	handler          http.Handler // Current generation handler
+	handlerRef       *atomicHandler // Indirection used by server.Handler so generations switch atomically
+}
+
+// atomicHandler is an http.Handler whose delegate can be swapped while the
+// owning http.Server keeps serving. Every request observes either the
+// previous complete handler chain or the next one; a request can never see a
+// partially rebuilt chain.
+type atomicHandler struct {
+	current atomic.Pointer[http.Handler]
+}
+
+func newAtomicHandler(h http.Handler) *atomicHandler {
+	ah := &atomicHandler{}
+	ah.Store(h)
+	return ah
+}
+
+func (a *atomicHandler) Store(h http.Handler) {
+	a.current.Store(&h)
+}
+
+func (a *atomicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	(*a.current.Load()).ServeHTTP(w, r)
 }
 
 // handlerWithClose wraps an http.Handler and preserves the Close method from the underlying proxy.Handler
@@ -215,14 +239,17 @@ func (r *Registry) startService(svcCfg config.Service) (*Service, error) {
 		return nil, err
 	}
 	svc.handler = handler
+	svc.handlerRef = newAtomicHandler(handler)
 	slog.Debug("handler created for service",
 		"service", svcCfg.Name,
 		"duration", time.Since(handlerStart),
 	)
 
-	// Create HTTP server with timeouts
+	// Create HTTP server with timeouts. It always dispatches through the
+	// atomic handler reference so a global configuration generation can
+	// replace the whole handler chain without restarting the listener.
 	svc.server = &http.Server{
-		Handler:           svc.handler,
+		Handler:           svc.handlerRef,
 		ReadHeaderTimeout: config.DefaultReadHeaderTimeout,
 	}
 
@@ -273,6 +300,9 @@ func (s *Service) Handler() http.Handler {
 // SetHandler sets the handler for the service (used for testing)
 func (s *Service) SetHandler(h http.Handler) {
 	s.handler = h
+	if s.handlerRef != nil {
+		s.handlerRef.Store(h)
+	}
 }
 
 // CreateHandler creates the HTTP handler for the service, returning an error if configuration is invalid
@@ -709,4 +739,134 @@ func (r *Registry) UpdateService(name string, newCfg config.Service) error {
 		"new_backend", newCfg.BackendAddr,
 	)
 	return nil
+}
+
+// closeHandler releases a handler's underlying resources (metrics collection
+// goroutine and idle transport connections) when it implements io.Closer.
+func closeHandler(h http.Handler) {
+	if h == nil {
+		return
+	}
+	if closer, ok := h.(io.Closer); ok {
+		if err := closer.Close(); err != nil {
+			slog.Warn("failed to close handler", "error", err)
+		}
+	}
+}
+
+// discardGenerationHandlers closes every candidate handler after a failed
+// generation preparation, ensuring no transports or metrics goroutines leak
+// from the abandoned candidate.
+func discardGenerationHandlers(candidates map[string]http.Handler) {
+	for name, h := range candidates {
+		closeHandler(h)
+		slog.Debug("discarded candidate handler", "service", name)
+	}
+}
+
+// DiscardGenerationHandlers releases every candidate handler returned by
+// BuildGenerationHandlers when generation preparation fails before commit.
+func (r *Registry) DiscardGenerationHandlers(candidates map[string]http.Handler) {
+	discardGenerationHandlers(candidates)
+}
+
+// BuildGenerationHandlers creates the next-generation handler for each
+// running service whose shape is unchanged in newCfg. Those services keep
+// their listener and tsnet node; only the handler chain (trusted proxies,
+// transport timeouts, access log and body limits) is rebuilt.
+//
+// No running state is modified. Candidates are resolved and validated in
+// full before the caller touches any runtime resource. If any handler fails
+// to build, every candidate built so far is released and the error is
+// returned, leaving all in-service handlers untouched.
+func (r *Registry) BuildGenerationHandlers(newCfg *config.Config) (map[string]http.Handler, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	candidates := make(map[string]http.Handler, len(r.services))
+
+	for i := range newCfg.Services {
+		newSvcCfg := &newCfg.Services[i]
+		oldSvc, running := r.services[newSvcCfg.Name]
+		if !running {
+			// New service: handled through the dynamic add path.
+			continue
+		}
+		if !config.ServiceShapeEqual(oldSvc.Config, *newSvcCfg) {
+			// Service definition itself changed: handled through the dynamic
+			// update path (listener/tsnet recreation).
+			continue
+		}
+
+		candidate := &Service{
+			Name:             newSvcCfg.Name,
+			Config:           *newSvcCfg,
+			globalConfig:     newCfg,
+			tsServer:         r.tsServer,
+			metricsCollector: r.metricsCollector,
+		}
+
+		handler, err := candidate.CreateHandler()
+		if err != nil {
+			discardGenerationHandlers(candidates)
+			return nil, fmt.Errorf("build generation handler for service %q: %w", newSvcCfg.Name, err)
+		}
+		candidates[newSvcCfg.Name] = handler
+	}
+
+	return candidates, nil
+}
+
+// CommitGeneration atomically installs the prepared candidate handlers,
+// repoints each service and the registry at newCfg, and then releases the
+// replaced previous-generation handlers. Requests in flight keep using the
+// old handler they already selected; new requests observe the complete new
+// generation. It must only be called after BuildGenerationHandlers and all
+// other candidate resources (e.g. the metrics listener) have been prepared.
+func (r *Registry) CommitGeneration(newCfg *config.Config, candidates map[string]http.Handler) {
+	r.mu.Lock()
+	previous := make([]http.Handler, 0, len(candidates))
+	swapped := 0
+
+	for name, handler := range candidates {
+		svc, ok := r.services[name]
+		if !ok {
+			// Service vanished during preparation (possible only via a
+			// concurrent mutation); release the orphan candidate.
+			previous = append(previous, handler)
+			continue
+		}
+		newSvcCfg, exists := findServiceConfig(newCfg, name)
+		if !exists {
+			previous = append(previous, handler)
+			continue
+		}
+		previous = append(previous, svc.handler)
+		svc.handlerRef.Store(handler)
+		svc.handler = handler
+		svc.Config = newSvcCfg
+		svc.globalConfig = newCfg
+		swapped++
+	}
+	r.config = newCfg
+	r.mu.Unlock()
+
+	// Close replaced handlers only after every service has switched, so the
+	// old generation disappears as a single unit. CloseIdleConnections does
+	// not interrupt requests still in flight on the old transport.
+	for _, h := range previous {
+		closeHandler(h)
+	}
+
+	slog.Info("service handler generation committed", "services", swapped)
+}
+
+// findServiceConfig returns the named service configuration from cfg.
+func findServiceConfig(cfg *config.Config, name string) (config.Service, bool) {
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == name {
+			return cfg.Services[i], true
+		}
+	}
+	return config.Service{}, false
 }

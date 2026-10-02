@@ -723,37 +723,14 @@ func (p *Provider) removeServiceByContainerName(cfg *config.Config, containerNam
 	return newCfg
 }
 
-// configEqual compares two configurations for equality
+// configEqual compares two configurations for equality. Both the global
+// section and the service set must match: a change confined to global labels
+// (trusted proxies, transport timeouts, access log, body limits,
+// metrics_addr, ...) is a distinct configuration that the App applies as an
+// atomic generation, rather than being dropped or mistaken for per-service
+// restarts.
 func (p *Provider) configEqual(a, b *config.Config) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-
-	if len(a.Services) != len(b.Services) {
-		return false
-	}
-
-	// Create a map of new services for efficient lookup
-	bServices := make(map[string]config.Service, len(b.Services))
-	for _, svc := range b.Services {
-		bServices[svc.Name] = svc
-	}
-
-	// Compare each service from the old config with the new one
-	for _, aSvc := range a.Services {
-		bSvc, ok := bServices[aSvc.Name]
-		if !ok {
-			// A service was removed
-			return false
-		}
-		if !config.ServiceConfigEqual(aSvc, bSvc) {
-			// A service's configuration has changed
-			return false
-		}
-	}
-
-	// Note: This assumes global/tailscale config doesn't change dynamically
-	return true
+	return config.Equal(a, b)
 }
 
 // readFile is a helper for testing

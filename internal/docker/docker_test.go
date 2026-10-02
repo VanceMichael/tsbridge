@@ -1938,6 +1938,58 @@ func TestProvider_ConfigEqual(t *testing.T) {
 
 		assert.False(t, provider.configEqual(cfg1, cfg2))
 	})
+
+	t.Run("global-only change is detected", func(t *testing.T) {
+		svc := func() config.Service {
+			return config.Service{Name: "svc1", BackendAddr: "api:8080"}
+		}
+
+		// Same service set, different global sections must be reported as a
+		// change so a global-only generation reaches the App.
+		cfg1 := &config.Config{
+			Global:   config.Global{MetricsAddr: ":9090", TrustedProxies: []string{"10.0.0.0/8"}},
+			Services: []config.Service{svc()},
+		}
+		cfg2 := &config.Config{
+			Global:   config.Global{MetricsAddr: ":9091", TrustedProxies: []string{"10.0.0.0/8"}},
+			Services: []config.Service{svc()},
+		}
+		assert.False(t, provider.configEqual(cfg1, cfg2))
+
+		cfg3 := &config.Config{
+			Global:   config.Global{MetricsAddr: ":9091", TrustedProxies: []string{"172.16.0.0/12"}},
+			Services: []config.Service{svc()},
+		}
+		assert.False(t, provider.configEqual(cfg2, cfg3))
+	})
+
+	t.Run("identical global and services are equal", func(t *testing.T) {
+		cfg1 := &config.Config{
+			Global:   config.Global{MetricsAddr: ":9090", TrustedProxies: []string{"10.0.0.0/8"}},
+			Services: []config.Service{{Name: "svc1", BackendAddr: "api:8080"}},
+		}
+		cfg2 := &config.Config{
+			Global:   config.Global{MetricsAddr: ":9090", TrustedProxies: []string{"10.0.0.0/8"}},
+			Services: []config.Service{{Name: "svc1", BackendAddr: "api:8080"}},
+		}
+		assert.True(t, provider.configEqual(cfg1, cfg2))
+	})
+
+	t.Run("global change with inherited service values is detected", func(t *testing.T) {
+		// Normalization copies global access_log/body limits into services,
+		// so a global-only label change also moves normalized service values.
+		cfg1 := &config.Config{Global: config.Global{AccessLog: new(true)}}
+		cfg1.Services = []config.Service{{Name: "svc1"}}
+		cfg1.SetDefaults()
+		cfg1.Normalize()
+
+		cfg2 := &config.Config{Global: config.Global{AccessLog: new(false)}}
+		cfg2.Services = []config.Service{{Name: "svc1"}}
+		cfg2.SetDefaults()
+		cfg2.Normalize()
+
+		assert.False(t, provider.configEqual(cfg1, cfg2))
+	})
 }
 
 func TestRemoveServiceByContainerName(t *testing.T) {

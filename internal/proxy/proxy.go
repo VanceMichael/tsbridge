@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -80,6 +81,9 @@ type httpHandler struct {
 	activeRequests int64
 	// Streaming support
 	flushInterval *time.Duration
+	// closeOnce guards Close against duplicate invocations when a handler
+	// generation is replaced and then the service is stopped.
+	closeOnce sync.Once
 }
 
 // NewHandler creates a new HTTP reverse proxy handler with the provided configuration
@@ -393,17 +397,19 @@ func (h *httpHandler) collectMetrics() {
 	h.metricsCollector.UpdateConnectionPoolMetrics(h.serviceName, active)
 }
 
-// Close stops metrics collection and cleans up resources
+// Close stops metrics collection and cleans up resources. It is safe to
+// call more than once.
 func (h *httpHandler) Close() error {
-	if h.stopMetrics != nil {
-		close(h.stopMetrics)
-	}
+	h.closeOnce.Do(func() {
+		if h.stopMetrics != nil {
+			close(h.stopMetrics)
+		}
 
-	// Close idle transport connections to prevent lingering after handler shutdown
-	if h.transport != nil {
-		h.transport.CloseIdleConnections()
-	}
-
+		// Close idle transport connections to prevent lingering after handler shutdown
+		if h.transport != nil {
+			h.transport.CloseIdleConnections()
+		}
+	})
 	return nil
 }
 

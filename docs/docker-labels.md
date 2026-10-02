@@ -142,6 +142,8 @@ Provide either OAuth credentials or an auth key. OAuth services also require tag
 | `tsbridge.global.flush_interval` | `0s` | Response flush interval; `-1ms` flushes immediately |
 | `tsbridge.global.max_request_body_size` | `50MB` | Request body limit; `-1` disables it |
 
+Global labels are applied as a single configuration generation. When the provider delivers a changed global section (for example when the tsbridge container is recreated with new labels), tsbridge builds and validates the complete candidate before touching anything running; then every service's trusted-proxy judgment, backend transport timeouts, access logging and request body limits switch over atomically, together with the Prometheus listener (address and read-header timeout). Tailscale listeners and backend connections are not recreated. If a candidate cannot be prepared (e.g. the new `metrics_addr` is already bound), the candidate is discarded in full, the previous generation keeps serving, and the same configuration is retried on the next event or poll once the fault clears.
+
 ### Labels on service containers
 
 `tsbridge.enabled=true` opts a container into discovery; `tsbridge.enable=true` is an equivalent alias. Set either `tsbridge.service.port` or `tsbridge.service.backend_addr`; when both are absent, tsbridge uses the container's only exposed port.
