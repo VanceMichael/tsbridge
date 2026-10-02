@@ -13,9 +13,15 @@ import (
 	"github.com/jtdowney/tsbridge/internal/metrics"
 	"github.com/jtdowney/tsbridge/internal/service"
 	"github.com/jtdowney/tsbridge/internal/tailscale"
+	tsnetpkg "github.com/jtdowney/tsbridge/internal/tsnet"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
+
+// initialGeneration numbers the tailscale Server/Registry generation created
+// when the App starts; every accepted Tailscale configuration rotation
+// increments it.
+const initialGeneration = 1
 
 // App encapsulates the tsbridge application lifecycle
 type App struct {
@@ -24,10 +30,18 @@ type App struct {
 	tsServer      *tailscale.Server
 	registry      *service.Registry
 	metricsServer *metrics.Server
-	startOnce     sync.Once
-	stopOnce      sync.Once
+	// generation identifies the currently owned tailscale Server generation.
+	generation uint64
+	// tsNetFactory builds tsnet-backed servers; nil uses the real tsnet
+	// implementation.
+	tsNetFactory tsnetpkg.TSNetServerFactory
+	startOnce    sync.Once
+	stopOnce     sync.Once
 	configWatcher context.CancelFunc
 	mu            sync.RWMutex
+	// stopped is set under mu when Shutdown begins; afterwards no reload may
+	// create new generations or resources.
+	stopped bool
 }
 
 // Options allows customizing App creation for testing
@@ -35,6 +49,18 @@ type Options struct {
 	TSServer *tailscale.Server
 	Registry *service.Registry
 	Provider config.Provider
+	// TSNetFactory overrides the tsnet server factory used for the initial
+	// generation and every generation created by a Tailscale config rotation.
+	TSNetFactory tsnetpkg.TSNetServerFactory
+}
+
+// newTailscaleServer creates a tailscale Server for a generation, honoring an
+// injected tsnet factory.
+func newTailscaleServer(cfg config.Tailscale, factory tsnetpkg.TSNetServerFactory) (*tailscale.Server, error) {
+	if factory != nil {
+		return tailscale.NewServerWithFactory(cfg, factory)
+	}
+	return tailscale.NewServer(cfg)
 }
 
 // NewApp creates a new App instance with the given configuration
@@ -69,7 +95,7 @@ func NewAppWithOptions(cfg *config.Config, opts Options) (*App, error) {
 	if tsServer == nil {
 		slog.Debug("creating tailscale server")
 		var err error
-		tsServer, err = tailscale.NewServer(cfg.Tailscale)
+		tsServer, err = newTailscaleServer(cfg.Tailscale, opts.TSNetFactory)
 		if err != nil {
 			return nil, tserrors.WrapResource(err, "failed to create tailscale server")
 		}
@@ -81,10 +107,12 @@ func NewAppWithOptions(cfg *config.Config, opts Options) (*App, error) {
 	}
 
 	app := &App{
-		cfg:      cfg,
-		provider: opts.Provider,
-		tsServer: tsServer,
-		registry: registry,
+		cfg:           cfg,
+		provider:      opts.Provider,
+		tsServer:      tsServer,
+		registry:      registry,
+		generation:    initialGeneration,
+		tsNetFactory:  opts.TSNetFactory,
 	}
 
 	if cfg.Global.MetricsAddr != "" {
@@ -191,6 +219,12 @@ func (a *App) Shutdown(ctx context.Context) error {
 
 // performShutdown performs the actual shutdown sequence
 func (a *App) performShutdown(ctx context.Context) error {
+	// Block new reloads/generations and wait for any in-flight rotation to
+	// finish before tearing resources down.
+	a.mu.Lock()
+	a.stopped = true
+	a.mu.Unlock()
+
 	var errs []error
 
 	if a.configWatcher != nil {
@@ -249,14 +283,38 @@ func (a *App) watchConfigChanges(ctx context.Context, configCh <-chan *config.Co
 
 // ReloadConfig reloads the configuration and restarts affected services
 // This method is exported for testing purposes
+//
+// When the Tailscale control-plane configuration changes, a new tailscale
+// Server generation is coordinated atomically: the candidate is validated
+// before any online service is interrupted, services are migrated one by one,
+// and on any tsnet Up/authentication/Listen failure every candidate node is
+// cleaned up and all previously online services are restored on the outgoing
+// generation. The committed config only advances when the rotation succeeds,
+// so a later event retries the rejected candidate.
 func (a *App) ReloadConfig(newCfg *config.Config) error {
 	start := time.Now()
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	if a.stopped {
+		if a.registry != nil {
+			if collector := a.registry.GetMetricsCollector(); collector != nil {
+				collector.RecordConfigReload(false, time.Since(start))
+			}
+		}
+		return errAppStopped
+	}
+
 	oldCfg := a.cfg
-	err := reloadConfigWithRegistry(oldCfg, newCfg, a.registry)
+	tailscaleRotated := !config.TailscaleEqual(oldCfg.Tailscale, newCfg.Tailscale)
+
+	var err error
+	if tailscaleRotated {
+		err = a.rotateTailscaleGeneration(context.Background(), oldCfg, newCfg)
+	} else {
+		err = reloadConfigWithRegistry(oldCfg, newCfg, a.registry)
+	}
 
 	if a.registry != nil {
 		if collector := a.registry.GetMetricsCollector(); collector != nil {
@@ -264,9 +322,23 @@ func (a *App) ReloadConfig(newCfg *config.Config) error {
 		}
 	}
 
-	// Always update the config, even if some operations failed
-	// This ensures we're working with the latest intended configuration
-	a.cfg = newCfg
+	switch {
+	case err == nil:
+		// Commit: registry, services and tsnet nodes all belong to the same
+		// (possibly new) generation.
+		a.cfg = newCfg
+	case tailscaleRotated:
+		// The rotation rolled back completely; keep the previous config so
+		// the unchanged old generation stays authoritative and the next
+		// event can retry the candidate after the external fault is fixed.
+		slog.Warn("keeping previous tailscale generation; configuration not advanced",
+			"generation", a.generation,
+			"error", err)
+	default:
+		// Legacy semantics for service-only reloads: always work from the
+		// latest intended configuration even when individual operations fail.
+		a.cfg = newCfg
+	}
 
 	return err
 }

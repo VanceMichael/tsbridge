@@ -265,9 +265,15 @@ func (r *Registry) startService(svcCfg config.Service) (*Service, error) {
 	return svc, nil
 }
 
-// Handler returns the HTTP handler for this service
+// Handler returns the HTTP handler for the service
 func (s *Service) Handler() http.Handler {
 	return s.handler
+}
+
+// TSServer returns the tailscale Server generation that owns this service's
+// tsnet node and listener.
+func (s *Service) TSServer() *tailscale.Server {
+	return s.tsServer
 }
 
 // SetHandler sets the handler for the service (used for testing)

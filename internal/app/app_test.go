@@ -1485,15 +1485,20 @@ func TestFindServicesToUpdate(t *testing.T) {
 
 func TestConfigWatchIntegration(t *testing.T) {
 	t.Run("provider with config watching", func(t *testing.T) {
+		// Tailscale config must stay identical across the watch event; only
+		// service-level changes are under test here, so no generation rotation
+		// should occur.
+		tailscaleCfg := config.Tailscale{
+			StateDir: t.TempDir(),
+			AuthKey:  "test-auth-key",
+		}
+
 		// Create a mock provider that supports watching
 		mockProvider := &mockConfigProvider{
 			name: "mock",
 			loadFunc: func(ctx context.Context) (*config.Config, error) {
 				cfg := &config.Config{
-					Tailscale: config.Tailscale{
-						StateDir: t.TempDir(),
-						AuthKey:  "test-auth-key",
-					},
+					Tailscale: tailscaleCfg,
 					Services: []config.Service{
 						{
 							Name:        "test-service",
@@ -1510,10 +1515,7 @@ func TestConfigWatchIntegration(t *testing.T) {
 					// Simulate a config change after a short delay
 					time.Sleep(100 * time.Millisecond)
 					cfg := &config.Config{
-						Tailscale: config.Tailscale{
-							StateDir: t.TempDir(),
-							AuthKey:  "test-auth-key",
-						},
+						Tailscale: tailscaleCfg,
 						Services: []config.Service{
 							{
 								Name:        "test-service",

@@ -42,16 +42,20 @@ const (
 
 // Provider implements config.Provider for Docker label-based configuration
 type Provider struct {
-	client          DockerClient
-	labelPrefix     string
-	socketPath      string
-	pollInterval    time.Duration
-	mu              sync.RWMutex
-	lastConfig      *config.Config
-	cachedTailscale *config.Tailscale
-	debounceTimer   *time.Timer
-	debounceMu      sync.Mutex
-	pollTicker      *time.Ticker
+	client       DockerClient
+	labelPrefix  string
+	socketPath   string
+	pollInterval time.Duration
+	mu           sync.RWMutex
+	lastConfig   *config.Config
+	// lastTailscale holds the last successfully resolved Tailscale config.
+	// It is only used to recover credentials sourced from the process
+	// environment (TS_AUTHKEY), which the first config resolution unsets;
+	// label-declared values are always parsed fresh.
+	lastTailscale  *config.Tailscale
+	debounceTimer  *time.Timer
+	debounceMu     sync.Mutex
+	pollTicker     *time.Ticker
 }
 
 // Options contains configuration options for the Docker provider
@@ -178,7 +182,10 @@ func (p *Provider) Load(ctx context.Context) (*config.Config, error) {
 		return nil, errors.WrapProviderError(err, "docker", errors.ErrTypeResource, "finding tsbridge container")
 	}
 
-	// Parse global configuration from tsbridge container labels
+	// Parse global configuration from the tsbridge container's current
+	// labels on every load. Rotating credentials, control_url or state_dir
+	// labels must be observed here instead of being silently replaced by
+	// the process-start configuration.
 	cfg := &config.Config{}
 	if err := p.parseGlobalConfig(selfContainer, cfg); err != nil {
 		if p.lastConfig != nil {
@@ -187,14 +194,11 @@ func (p *Provider) Load(ctx context.Context) (*config.Config, error) {
 		slog.Warn("invalid global Docker configuration; using defaults for invalid labels", "error", err)
 	}
 
-	// Reuse cached Tailscale config on subsequent loads. The initial
-	// config resolution clears auth key env vars (TS_AUTHKEY) to prevent
-	// the tsnet library from independently reading them. Without this
-	// cache, subsequent Load() calls would fail to re-resolve the auth
-	// key from the now-cleared env vars.
-	if p.cachedTailscale != nil {
-		cfg.Tailscale = *p.cachedTailscale
-	}
+	// Record whether the raw labels declare any credential source before
+	// secret resolution clears the env/file specifier fields. This lets us
+	// distinguish a label-declared rotation from a process-environment
+	// credential that can no longer be re-read.
+	credentialSourceDeclared := hasTailscaleCredentialSource(cfg.Tailscale)
 
 	// Find all containers with tsbridge.enabled=true
 	serviceContainers, err := p.findServiceContainers(ctx)
@@ -238,11 +242,17 @@ func (p *Provider) Load(ctx context.Context) (*config.Config, error) {
 		return nil, err
 	}
 
-	// Cache the resolved Tailscale config after first successful load
-	if p.cachedTailscale == nil {
-		cached := cfg.Tailscale
-		p.cachedTailscale = &cached
-	}
+	// Recover credentials that can only originate from the process
+	// environment (the first resolution unsets TS_AUTHKEY so tsnet cannot
+	// consume it independently). Label/file declared credentials were
+	// resolved fresh above and are never overwritten, so rotations reach
+	// the hot-reload path as real differences.
+	p.preserveProcessAuthKey(cfg, credentialSourceDeclared)
+
+	// Remember the resolved Tailscale config for the next load's
+	// process-environment fallback.
+	resolvedTailscale := cfg.Tailscale
+	p.lastTailscale = &resolvedTailscale
 
 	slog.Info("Docker configuration loaded successfully",
 		"services", len(cfg.Services),
@@ -723,10 +733,49 @@ func (p *Provider) removeServiceByContainerName(cfg *config.Config, containerNam
 	return newCfg
 }
 
+// hasTailscaleCredentialSource reports whether the raw label-derived
+// Tailscale config declares any credential source (inline value, env var or
+// file) for either OAuth or auth key authentication.
+func hasTailscaleCredentialSource(ts config.Tailscale) bool {
+	return ts.AuthKey.Value() != "" || ts.AuthKeyEnv != "" || ts.AuthKeyFile != "" ||
+		ts.OAuthClientID != "" || ts.OAuthClientIDEnv != "" || ts.OAuthClientIDFile != "" ||
+		ts.OAuthClientSecret.Value() != "" || ts.OAuthClientSecretEnv != "" || ts.OAuthClientSecretFile != ""
+}
+
+// preserveProcessAuthKey restores the auth key resolved on a previous load
+// when the current labels declare no credential source at all. The first
+// successful config resolution unsets TS_AUTHKEY so the tsnet library cannot
+// consume it independently; deployments that pass the key solely through that
+// process environment would otherwise appear to lose their credentials on
+// every subsequent load.
+//
+// A credential explicitly declared via labels, env-var label or file label is
+// always resolved fresh and is never replaced here, ensuring rotations reach
+// the hot-reload path.
+func (p *Provider) preserveProcessAuthKey(cfg *config.Config, sourceDeclared bool) {
+	if sourceDeclared || p.lastTailscale == nil {
+		return
+	}
+	// Fresh resolution found credentials from another source; trust them.
+	if cfg.Tailscale.AuthKey.Value() != "" || cfg.Tailscale.OAuthClientID != "" {
+		return
+	}
+	if cachedKey := p.lastTailscale.AuthKey.Value(); cachedKey != "" {
+		slog.Debug("reusing auth key resolved from process environment on initial load")
+		cfg.Tailscale.AuthKey = config.RedactedString(cachedKey)
+	}
+}
+
 // configEqual compares two configurations for equality
 func (p *Provider) configEqual(a, b *config.Config) bool {
 	if a == nil || b == nil {
 		return a == b
+	}
+
+	// Tailscale (credentials, control URL, state directory, ...) changes
+	// require a control-plane generation rotation and must be detected.
+	if !config.TailscaleEqual(a.Tailscale, b.Tailscale) {
+		return false
 	}
 
 	if len(a.Services) != len(b.Services) {
@@ -752,7 +801,6 @@ func (p *Provider) configEqual(a, b *config.Config) bool {
 		}
 	}
 
-	// Note: This assumes global/tailscale config doesn't change dynamically
 	return true
 }
 

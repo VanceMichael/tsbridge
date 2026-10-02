@@ -481,11 +481,23 @@ Cross-compose networking not working?
 
 Label changes ignored?
 
-- Labels are only read when container starts
-- Restart container to apply new labels
+- Docker labels are immutable on a running container: recreate the container (`docker compose up -d` after editing labels) to change them.
+- Service-container label changes are picked up from container events and the periodic poll.
+- Tailscale labels on the tsbridge container (credentials, `control_url`, `state_dir`) are re-read on every load and trigger a coordinated hot rotation with no process restart required; see [Tailscale configuration rotation](#tailscale-configuration-rotation).
 
 Cannot connect between compose files?
 
 - Ensure both files use the same network name
 - Network must be marked as `external: true` in dependent compose files
 - Create network manually if needed: `docker network create <network-name>`
+
+## Tailscale configuration rotation
+
+When `tsbridge.tailscale.*` labels change on the tsbridge container, tsbridge rotates to a new Tailscale server generation without restarting the process:
+
+1. The candidate credentials, control plane URL and state directory are validated before any online service is interrupted.
+2. Services are migrated one at a time onto fresh tsnet nodes and listeners owned by the new generation; TLS and Funnel settings are preserved.
+3. On success the previous generation is retired, its nodes are closed, and all subsequent service additions/updates use the new configuration.
+4. If the candidate is invalid, or a tsnet authentication/Up/Listen failure happens mid-migration, candidate nodes are cleaned up and every interrupted service is restored on the previous generation with its original reachability. Fix the external cause (credentials, control plane, network) and the next event retries the rotation automatically.
+
+Changing ordinary service labels only restarts the affected service; an unchanged Tailscale configuration never rotates nodes. Deployments that authenticate from existing on-disk state (no credentials configured) keep working, as do file-based configuration startup and graceful shutdown.

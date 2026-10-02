@@ -25,7 +25,16 @@ const (
 	certificatePrimingTimeout = 30 * time.Second
 	tsnetServerStartDelay     = 5 * time.Second
 	tsnetServerCloseTimeout   = 3 * time.Second
+	// PreflightProbeName is the hostname of the ephemeral probe node used to
+	// validate a candidate control-plane configuration before a generation
+	// rotation interrupts any online service.
+	PreflightProbeName = "tsbridge-preflight"
 )
+
+// ErrServerClosed is returned by Server methods that create resources after
+// the server has been closed (for example when a retired tailscale
+// generation is asked to create another tsnet node).
+var ErrServerClosed = tserrors.NewResourceError("tailscale server is closed and cannot create resources")
 
 // Server wraps a tsnet.Server with tsbridge-specific functionality
 type Server struct {
@@ -34,8 +43,9 @@ type Server struct {
 	serviceServers map[string]tsnetpkg.TSNetServer
 	// serverFactory creates new TSNetServer instances
 	serverFactory tsnetpkg.TSNetServerFactory
-	// mu protects serviceServers map
-	mu sync.Mutex
+	// mu protects serviceServers map and closed
+	mu     sync.Mutex
+	closed bool
 }
 
 // NewServerWithFactory creates a new tailscale server instance with a custom TSNetServer factory
@@ -65,9 +75,130 @@ func NewServer(cfg config.Tailscale) (*Server, error) {
 	return NewServerWithFactory(cfg, factory)
 }
 
+// Preflight validates a candidate Tailscale configuration BEFORE any online
+// service is interrupted by a generation rotation. It verifies that:
+//
+//   - the state directory exists and is writable;
+//   - the configured credentials can authenticate a node against the
+//     control URL (by bringing up a short-lived ephemeral probe node).
+//
+// The probe node is ephemeral and closed immediately, so it disappears from
+// the tailnet and leaves no registered node behind. Deployments without any
+// configured credentials rely on existing on-disk state and skip the live
+// probe; the per-service migration still performs a real Up for every node,
+// preserving the auth-free startup behavior.
+//
+// A failed preflight closes nothing the caller owns and never touches online
+// nodes; the candidate generation can simply be discarded.
+func (s *Server) Preflight(ctx context.Context) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrServerClosed
+	}
+	s.mu.Unlock()
+
+	baseStateDir, stateDirSource := s.resolveBaseStateDir()
+	slog.Debug("preflight validating tailscale candidate",
+		"state_dir", baseStateDir,
+		"source", stateDirSource,
+		"control_url", s.controlURLOrDefault(),
+	)
+
+	// 1. The state directory must exist and be writable.
+	if err := os.MkdirAll(baseStateDir, 0o700); err != nil {
+		return tserrors.WrapResource(err, fmt.Sprintf("creating tailscale state directory %q", baseStateDir))
+	}
+	probeFile, err := os.CreateTemp(baseStateDir, ".preflight-*")
+	if err != nil {
+		return tserrors.WrapResource(err, fmt.Sprintf("writing to tailscale state directory %q", baseStateDir))
+	}
+	_ = probeFile.Close()
+	_ = os.Remove(probeFile.Name())
+
+	// 2. Without credentials the node is expected to authenticate from
+	// existing state; a brand-new ephemeral probe cannot do that, so the
+	// live check is deferred to the service migration.
+	if err := ValidateTailscaleSecrets(s.config); err != nil {
+		slog.Debug("preflight skipping live control-plane probe; no credentials configured (existing-state mode)")
+		return nil
+	}
+
+	// OAuth-minted keys require tags. Tag-scoped OAuth clients (the common
+	// case) cannot mint an untagged key, and default tags may not be
+	// declared even though every service carries tags; defer to the first
+	// service migration in that case rather than rejecting falsely.
+	if s.config.OAuthClientID != "" && len(s.config.DefaultTags) == 0 {
+		slog.Debug("preflight skipping live control-plane probe; OAuth without default tags")
+		return nil
+	}
+
+	return s.runPreflightProbe(ctx, baseStateDir)
+}
+
+// controlURLOrDefault returns the configured control URL or a marker for the
+// Tailscale default used in logging.
+func (s *Server) controlURLOrDefault() string {
+	if s.config.ControlURL != "" {
+		return s.config.ControlURL
+	}
+	return "https://controlplane.tailscale.com"
+}
+
+// runPreflightProbe brings up an ephemeral tsnet node with the candidate
+// configuration and tears it down immediately.
+func (s *Server) runPreflightProbe(ctx context.Context, baseStateDir string) error {
+	probe := s.serverFactory(preflightProbeName)
+	probe.SetHostname(preflightProbeName)
+	probe.SetEphemeral(true)
+	if s.config.ControlURL != "" {
+		probe.SetControlURL(s.config.ControlURL)
+	}
+	probeStateDir := filepath.Join(baseStateDir, preflightProbeName)
+	probe.SetDir(probeStateDir)
+	// Best-effort cleanup of the throwaway probe state on every exit path.
+	defer func() { _ = os.RemoveAll(probeStateDir) }()
+
+	probeSvc := config.Service{
+		Name:      preflightProbeName,
+		Ephemeral: true,
+		Tags:      s.config.DefaultTags,
+	}
+	if _, err := s.prepareServiceAuth(probe, probeSvc, baseStateDir); err != nil {
+		_ = probe.Close()
+		return tserrors.WrapConfig(err, "preflight authentication validation failed")
+	}
+
+	start := time.Now()
+	upCtx, cancel := context.WithTimeout(ctx, config.DefaultStartupTimeout)
+	defer cancel()
+	if _, err := probe.Up(upCtx); err != nil {
+		_ = probe.Close()
+		if errors.Is(err, context.DeadlineExceeded) {
+			return tserrors.NewTimeoutError("preflight timed out contacting the Tailscale control plane (check control_url and network connectivity)", config.DefaultStartupTimeout)
+		}
+		return tserrors.WrapResource(err, "preflight failed to register node with the Tailscale control plane")
+	}
+	slog.Debug("preflight probe registered with control plane",
+		"duration", time.Since(start),
+		"control_url", s.controlURLOrDefault(),
+	)
+
+	if err := s.closeServerWithTimeout(probe, preflightProbeName, tsnetServerCloseTimeout); err != nil {
+		// The probe authenticated successfully; a close hiccup must not
+		// reject an otherwise valid candidate.
+		slog.Warn("preflight probe close failed; candidate remains valid", "error", err)
+	}
+	return nil
+}
+
 // Listen creates a listener for a specific service using its full configuration
 func (s *Server) Listen(svc config.Service, tlsMode string, funnelEnabled bool) (net.Listener, error) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, ErrServerClosed
+	}
 	defer s.mu.Unlock()
 
 	listenStart := time.Now()
@@ -355,9 +486,23 @@ func (s *Server) GetServiceServer(serviceName string) tsnetpkg.TSNetServer {
 	return s.serviceServers[serviceName]
 }
 
-// Close shuts down the server and all service servers
+// Closed reports whether the server has been retired. A closed server never
+// creates new tsnet nodes or listeners.
+func (s *Server) Closed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+// Close shuts down the server and all service servers. It is idempotent:
+// subsequent calls are no-ops, and Listen/Preflight reject once Close ran.
 func (s *Server) Close() error {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
 	servers := s.serviceServers
 	s.serviceServers = make(map[string]tsnetpkg.TSNetServer)
 	s.mu.Unlock()
@@ -407,6 +552,11 @@ func (s *Server) closeServerWithTimeout(server tsnetpkg.TSNetServer, serviceName
 // CloseService closes and removes the tsnet server for a specific service
 func (s *Server) CloseService(serviceName string) error {
 	s.mu.Lock()
+	if s.closed {
+		// A retired server owns no resources and creates none.
+		s.mu.Unlock()
+		return nil
+	}
 	server, exists := s.serviceServers[serviceName]
 	if !exists {
 		s.mu.Unlock()

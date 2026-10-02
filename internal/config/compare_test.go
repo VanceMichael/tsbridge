@@ -460,6 +460,100 @@ func durationPtrEqual(a, b *time.Duration) bool {
 	return *a == *b
 }
 
+func TestTailscaleEqual(t *testing.T) {
+	base := Tailscale{
+		OAuthClientID:         "client-id",
+		OAuthClientSecret:     RedactedString("client-secret"),
+		AuthKey:               RedactedString("auth-key"),
+		StateDir:              "/var/lib/tsbridge",
+		DefaultTags:           []string{"tag:server", "tag:proxy"},
+		ControlURL:            "https://headscale.example.net",
+		OAuthPreauthorized:    new(true),
+		OAuthClientIDEnv:      "",
+		OAuthClientIDFile:     "",
+		OAuthClientSecretEnv:  "",
+		OAuthClientSecretFile: "",
+		AuthKeyEnv:            "",
+		AuthKeyFile:           "",
+		StateDirEnv:           "",
+	}
+
+	tests := []struct {
+		name     string
+		mutate   func(*Tailscale)
+		expected bool
+	}{
+		{name: "identical", expected: true},
+		{name: "default tags reorder", mutate: func(ts *Tailscale) {
+			ts.DefaultTags = []string{"tag:proxy", "tag:server"}
+		}, expected: true},
+		{name: "rotated auth key", mutate: func(ts *Tailscale) {
+			ts.AuthKey = RedactedString("rotated-key")
+		}, expected: false},
+		{name: "rotated oauth secret", mutate: func(ts *Tailscale) {
+			ts.OAuthClientSecret = RedactedString("rotated-secret")
+		}, expected: false},
+		{name: "rotated oauth client id", mutate: func(ts *Tailscale) {
+			ts.OAuthClientID = "other-client"
+		}, expected: false},
+		{name: "control url changed", mutate: func(ts *Tailscale) {
+			ts.ControlURL = "https://control.other.example"
+		}, expected: false},
+		{name: "state dir changed", mutate: func(ts *Tailscale) {
+			ts.StateDir = "/srv/tsbridge"
+		}, expected: false},
+		{name: "default tags changed", mutate: func(ts *Tailscale) {
+			ts.DefaultTags = []string{"tag:server", "tag:edge"}
+		}, expected: false},
+		{name: "preauthorized changed", mutate: func(ts *Tailscale) {
+			ts.OAuthPreauthorized = new(false)
+		}, expected: false},
+		{name: "auth key env source changed", mutate: func(ts *Tailscale) {
+			ts.AuthKey = ""
+			ts.AuthKeyEnv = "ROTATED_AUTHKEY"
+		}, expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := base
+			b := base
+			if tt.mutate != nil {
+				tt.mutate(&b)
+			}
+			assert.Equal(t, tt.expected, TailscaleEqual(a, b))
+		})
+	}
+}
+
+// TestTailscaleEqualCoversAllFields ensures every Tailscale field participates
+// in the generation-difference comparison.
+func TestTailscaleEqualCoversAllFields(t *testing.T) {
+	tailscaleType := reflect.TypeFor[Tailscale]()
+	comparedFields := map[string]bool{
+		"OAuthClientID":         true,
+		"OAuthClientIDEnv":      true,
+		"OAuthClientIDFile":     true,
+		"OAuthClientSecret":     true,
+		"OAuthClientSecretEnv":  true,
+		"OAuthClientSecretFile": true,
+		"AuthKey":               true,
+		"AuthKeyEnv":            true,
+		"AuthKeyFile":           true,
+		"StateDir":              true,
+		"StateDirEnv":           true,
+		"DefaultTags":           true,
+		"ControlURL":            true,
+		"OAuthPreauthorized":    true,
+	}
+
+	for field := range tailscaleType.Fields() {
+		if !comparedFields[field.Name] {
+			t.Errorf("Field %s is not compared in TailscaleEqual", field.Name)
+		}
+	}
+}
+
 // TestServiceConfigEqualCoversAllFields uses reflection to ensure all fields
 // of the Service struct are compared in ServiceConfigEqual function.
 // This test prevents bugs when new fields are added but not included in comparison.
