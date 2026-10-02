@@ -30,6 +30,12 @@ const (
 	serviceStopTimeout    = 5 * time.Second
 )
 
+// ErrRegistryClosed is returned by registry mutations after shutdown has
+// started or completed. It guarantees that callers cannot create or change
+// services (and therefore listeners or tsnet nodes) during shutdown, even
+// when bypassing the App.
+var ErrRegistryClosed = errors.New("service registry is closed")
+
 // Registry manages all services
 type Registry struct {
 	config           *config.Config
@@ -37,6 +43,18 @@ type Registry struct {
 	services         map[string]*Service
 	metricsCollector *metrics.Collector
 	mu               sync.RWMutex
+	// closed is set under mu by Shutdown; when true all mutations are rejected.
+	closed bool
+	// closing is closed at most once via SignalShutdown/Shutdown. It lets
+	// in-flight service creation observe shutdown even while it holds mu, so
+	// candidates are torn down instead of being registered.
+	closing   chan struct{}
+	closeOnce sync.Once
+	// shutdownOnce/shutdownDone/shutdownErr converge concurrent or repeated
+	// Shutdown calls onto a single stop process with one shared result.
+	shutdownOnce sync.Once
+	shutdownDone chan struct{}
+	shutdownErr  error
 }
 
 // Service represents a single service instance
@@ -71,6 +89,41 @@ func NewRegistry(cfg *config.Config, tsServer *tailscale.Server) *Registry {
 		config:   cfg,
 		tsServer: tsServer,
 		services: make(map[string]*Service, len(cfg.Services)),
+		closing:  make(chan struct{}),
+	}
+}
+
+// SignalShutdown marks the registry as shutting down without blocking. It is
+// idempotent and safe to call while another goroutine holds the registry lock
+// (for example one blocked creating a service). Mutations already past their
+// admission checks must observe isClosing before registering new state.
+func (r *Registry) SignalShutdown() {
+	r.closeOnce.Do(func() {
+		// The channel is allocated by NewRegistry and never reassigned, so it
+		// is safe to read here without r.mu. A nil channel means the registry
+		// was created as a zero value (e.g. in tests); Shutdown's r.closed
+		// flag still provides rejection for those instances.
+		if r.closing != nil {
+			close(r.closing)
+		}
+	})
+}
+
+// isClosing reports whether shutdown has been signalled. Callers must hold
+// r.mu (or otherwise be serialized against Shutdown) when reading r.closed;
+// the channel check is lock-free and safe on a nil channel.
+func (r *Registry) isClosing() bool {
+	if r.closed {
+		return true
+	}
+	if r.closing == nil {
+		return false
+	}
+	select {
+	case <-r.closing:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -101,6 +154,10 @@ func (r *Registry) StartServices() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.isClosing() {
+		return ErrRegistryClosed
+	}
+
 	startTime := time.Now()
 	totalServices := len(r.config.Services)
 	failedServices := make(map[string]error)
@@ -111,6 +168,15 @@ func (r *Registry) StartServices() error {
 	)
 
 	for i, svcCfg := range r.config.Services {
+		// Stop admitting work if shutdown began while starting services.
+		if r.isClosing() {
+			slog.Info("skipping remaining service starts because registry is shutting down",
+				"started", i,
+				"total", totalServices,
+			)
+			break
+		}
+
 		serviceStart := time.Now()
 		slog.Debug("starting service",
 			"service", svcCfg.Name,
@@ -444,9 +510,32 @@ func (s *Service) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown gracefully shuts down all services
+// Shutdown gracefully shuts down all services.
+//
+// It is idempotent: the first call signals shutdown, rejects further
+// mutations, stops every service and aggregates stop errors; concurrent or
+// repeated calls wait for the same shutdown process and observe its result.
 func (r *Registry) Shutdown(ctx context.Context) error {
+	r.shutdownOnce.Do(func() {
+		r.shutdownDone = make(chan struct{})
+		go func() {
+			r.shutdownErr = r.doShutdown(ctx)
+			close(r.shutdownDone)
+		}()
+	})
+	<-r.shutdownDone
+	return r.shutdownErr
+}
+
+// doShutdown performs the single, serialized service stop sequence.
+func (r *Registry) doShutdown(ctx context.Context) error {
+	// Signal without holding the lock first so an in-flight
+	// AddService/UpdateService blocked on service creation can observe
+	// shutdown as soon as callers (or the App) abort the creation.
+	r.SignalShutdown()
+
 	r.mu.Lock()
+	r.closed = true
 	defer r.mu.Unlock()
 
 	var wg sync.WaitGroup
@@ -479,13 +568,22 @@ func (r *Registry) Shutdown(ctx context.Context) error {
 }
 
 // AddService dynamically starts and registers a new service.
-// Returns an error if the service already exists or fails to start.
+// Returns ErrRegistryClosed if the registry is shutting down or closed,
+// in which case the candidate service is never registered.
 // Thread-safe.
 func (r *Registry) AddService(svcCfg config.Service) error {
 	start := time.Now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Reject new services once shutdown has been signalled.
+	if r.isClosing() {
+		if r.metricsCollector != nil {
+			r.metricsCollector.RecordServiceOperation("add", false, time.Since(start))
+		}
+		return ErrRegistryClosed
+	}
 
 	// Check if service already exists
 	if _, exists := r.services[svcCfg.Name]; exists {
@@ -495,13 +593,21 @@ func (r *Registry) AddService(svcCfg config.Service) error {
 		return fmt.Errorf("service %s already exists", svcCfg.Name)
 	}
 
-	// Start the service
+	// Start the service (this may block on tsnet startup)
 	svc, err := r.startService(svcCfg)
 	if err != nil {
 		if r.metricsCollector != nil {
 			r.metricsCollector.RecordServiceOperation("add", false, time.Since(start))
 		}
 		return fmt.Errorf("failed to start service %s: %w", svcCfg.Name, err)
+	}
+
+	// Shutdown can begin while service creation is in flight. Tear the
+	// candidate down instead of registering it so no listener or tsnet node
+	// survives the shutdown process.
+	if r.isClosing() {
+		r.discardCandidate(svc, start)
+		return ErrRegistryClosed
 	}
 
 	// Add to registry
@@ -517,13 +623,47 @@ func (r *Registry) AddService(svcCfg config.Service) error {
 	return nil
 }
 
+// discardCandidate stops a service that was created during a reload but can
+// no longer be registered because shutdown started. The caller must hold
+// r.mu.
+func (r *Registry) discardCandidate(svc *Service, startedAt time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), serviceStopTimeout)
+	defer cancel()
+
+	if err := svc.Stop(ctx); err != nil {
+		slog.Debug("failed to stop discarded service candidate",
+			"service", svc.Config.Name,
+			"error", err)
+	}
+	if r.tsServer != nil {
+		if err := r.tsServer.CloseService(svc.Config.Name); err != nil {
+			slog.Debug("failed to close tsnet server for discarded candidate",
+				"service", svc.Config.Name,
+				"error", err)
+		}
+	}
+	if r.metricsCollector != nil {
+		r.metricsCollector.RecordServiceOperation("add", false, time.Since(startedAt))
+	}
+	slog.Info("discarded service candidate because registry is shutting down",
+		"service", svc.Config.Name)
+}
+
 // RemoveService stops and removes a service from the registry.
+// Returns ErrRegistryClosed if the registry is shutting down or closed.
 // Returns an error if the service is not found or fails to stop.
 func (r *Registry) RemoveService(name string) error {
 	start := time.Now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.isClosing() {
+		if r.metricsCollector != nil {
+			r.metricsCollector.RecordServiceOperation("remove", false, time.Since(start))
+		}
+		return ErrRegistryClosed
+	}
 
 	svc, exists := r.services[name]
 	if !exists {
@@ -631,12 +771,22 @@ func (r *Registry) validateServiceConfig(cfg config.Service) error {
 
 // UpdateService updates an existing service with new configuration at runtime.
 // Minimizes downtime by validating config before stopping the old service.
-// Thread-safe. Returns error if service not found, config invalid, stop/start fails.
+// Thread-safe. Returns ErrRegistryClosed if the registry is shutting down,
+// in which case no replacement service is registered.
+// Returns error if service not found, config invalid, stop/start fails.
 func (r *Registry) UpdateService(name string, newCfg config.Service) error {
 	start := time.Now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Reject updates once shutdown has been signalled.
+	if r.isClosing() {
+		if r.metricsCollector != nil {
+			r.metricsCollector.RecordServiceOperation("update", false, time.Since(start))
+		}
+		return ErrRegistryClosed
+	}
 
 	// Check if service exists
 	oldSvc, exists := r.services[name]
@@ -678,6 +828,17 @@ func (r *Registry) UpdateService(name string, newCfg config.Service) error {
 		}
 	}
 
+	// Shutdown may have started while the old service was being stopped.
+	// Do not create a replacement that would outlive the shutdown process.
+	if r.isClosing() {
+		delete(r.services, name)
+		if r.metricsCollector != nil {
+			r.metricsCollector.RecordServiceOperation("update", false, time.Since(start))
+			r.metricsCollector.SetActiveServices(len(r.services))
+		}
+		return ErrRegistryClosed
+	}
+
 	// Start the new service configuration
 	newSvc, err := r.startService(newCfg)
 	if err != nil {
@@ -692,6 +853,16 @@ func (r *Registry) UpdateService(name string, newCfg config.Service) error {
 		}
 
 		return fmt.Errorf("failed to start updated service %s: %w", name, err)
+	}
+
+	// Re-check before publishing: shutdown can begin during service creation.
+	if r.isClosing() {
+		r.discardCandidate(newSvc, start)
+		delete(r.services, name)
+		if r.metricsCollector != nil {
+			r.metricsCollector.SetActiveServices(len(r.services))
+		}
+		return ErrRegistryClosed
 	}
 
 	// Replace in registry

@@ -1505,30 +1505,32 @@ func TestConfigWatchIntegration(t *testing.T) {
 				return cfg, nil
 			},
 			watchFunc: func(ctx context.Context) (<-chan *config.Config, error) {
-				ch := make(chan *config.Config, 1)
-				go func() {
-					// Simulate a config change after a short delay
-					time.Sleep(100 * time.Millisecond)
-					cfg := &config.Config{
-						Tailscale: config.Tailscale{
-							StateDir: t.TempDir(),
-							AuthKey:  "test-auth-key",
+			ch := make(chan *config.Config, 1)
+			go func() {
+				defer close(ch)
+				// Simulate a config change after a short delay
+				time.Sleep(100 * time.Millisecond)
+				cfg := &config.Config{
+					Tailscale: config.Tailscale{
+						StateDir: t.TempDir(),
+						AuthKey:  "test-auth-key",
+					},
+					Services: []config.Service{
+						{
+							Name:        "test-service",
+							BackendAddr: "localhost:8081", // Changed
 						},
-						Services: []config.Service{
-							{
-								Name:        "test-service",
-								BackendAddr: "localhost:8081", // Changed
-							},
-						},
-					}
-					cfg.SetDefaults()
-					select {
-					case ch <- cfg:
-					case <-ctx.Done():
-					}
-				}()
-				return ch, nil
-			},
+					},
+				}
+				cfg.SetDefaults()
+				select {
+				case ch <- cfg:
+				case <-ctx.Done():
+				}
+				<-ctx.Done()
+			}()
+			return ch, nil
+		},
 		}
 
 		// Create app with the provider and mock tsnet server

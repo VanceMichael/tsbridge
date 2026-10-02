@@ -52,6 +52,11 @@ type Provider struct {
 	debounceTimer   *time.Timer
 	debounceMu      sync.Mutex
 	pollTicker      *time.Ticker
+	// closeOnce guarantees the client is closed exactly once even if Close
+	// is invoked concurrently or repeatedly (the App owns shutdown, but
+	// tests and signal paths may race).
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Options contains configuration options for the Docker provider
@@ -515,24 +520,30 @@ func (p *Provider) debouncedReload(ctx context.Context, configCh chan<- *config.
 	})
 }
 
-// Close closes the Docker client connection
+// Close stops the poll ticker and debounce timer, then closes the Docker
+// client. It is idempotent: concurrent or repeated calls converge onto one
+// execution and every caller observes the same result. The App calls Close
+// once its config watcher has exited, so the event stream is already torn
+// down before the client connection is closed.
 func (p *Provider) Close() error {
-	// Stop poll ticker if running
-	if p.pollTicker != nil {
-		p.pollTicker.Stop()
-	}
+	p.closeOnce.Do(func() {
+		// Stop poll ticker if running
+		if p.pollTicker != nil {
+			p.pollTicker.Stop()
+		}
 
-	// Stop debounce timer
-	p.debounceMu.Lock()
-	if p.debounceTimer != nil {
-		p.debounceTimer.Stop()
-	}
-	p.debounceMu.Unlock()
+		// Stop debounce timer
+		p.debounceMu.Lock()
+		if p.debounceTimer != nil {
+			p.debounceTimer.Stop()
+		}
+		p.debounceMu.Unlock()
 
-	if p.client != nil {
-		return p.client.Close()
-	}
-	return nil
+		if p.client != nil {
+			p.closeErr = p.client.Close()
+		}
+	})
+	return p.closeErr
 }
 
 // getLastConfig returns the last configuration in a thread-safe manner

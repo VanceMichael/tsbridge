@@ -27,6 +27,10 @@ const (
 	tsnetServerCloseTimeout   = 3 * time.Second
 )
 
+// ErrServerClosed is returned by Listen after Close has been called. It lets
+// callers distinguish a shutdown rejection from ordinary startup failures.
+var ErrServerClosed = errors.New("tailscale server is closed")
+
 // Server wraps a tsnet.Server with tsbridge-specific functionality
 type Server struct {
 	config config.Tailscale
@@ -34,8 +38,13 @@ type Server struct {
 	serviceServers map[string]tsnetpkg.TSNetServer
 	// serverFactory creates new TSNetServer instances
 	serverFactory tsnetpkg.TSNetServerFactory
-	// mu protects serviceServers map
+	// mu protects serviceServers map and the closed flag
 	mu sync.Mutex
+	// closed is set by Close; Listen rejects all further requests once true.
+	closed bool
+	// lifecycleCtx is cancelled by Close so blocked tsnet startup is aborted.
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
 }
 
 // NewServerWithFactory creates a new tailscale server instance with a custom TSNetServer factory
@@ -48,10 +57,14 @@ func NewServerWithFactory(cfg config.Tailscale, factory tsnetpkg.TSNetServerFact
 		return nil, tserrors.NewConfigError("OAuth client secret provided without client ID")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	return &Server{
-		config:         cfg,
-		serviceServers: make(map[string]tsnetpkg.TSNetServer),
-		serverFactory:  factory,
+		config:          cfg,
+		serviceServers:  make(map[string]tsnetpkg.TSNetServer),
+		serverFactory:   factory,
+		lifecycleCtx:    ctx,
+		lifecycleCancel: cancel,
 	}, nil
 }
 
@@ -69,6 +82,12 @@ func NewServer(cfg config.Tailscale) (*Server, error) {
 func (s *Server) Listen(svc config.Service, tlsMode string, funnelEnabled bool) (net.Listener, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Reject all new listeners once the server has been closed so that callers
+	// cannot resurrect tsnet nodes after shutdown, even by bypassing the App.
+	if s.closed {
+		return nil, ErrServerClosed
+	}
 
 	listenStart := time.Now()
 	slog.Debug("starting listener creation for service",
@@ -203,10 +222,16 @@ func (s *Server) prepareServiceAuth(serviceServer tsnetpkg.TSNetServer, svc conf
 
 // startServerWithTimeout starts a tsnet server with a timeout to prevent hanging.
 // Uses the context-aware Up() method which handles cancellation internally,
-// avoiding concurrency issues between Start() and Close().
+// avoiding concurrency issues between Start() and Close(). The timeout context
+// is derived from the server lifecycle so Close aborts startup immediately.
 func (s *Server) startServerWithTimeout(server tsnetpkg.TSNetServer, serviceName string, timeout time.Duration) error {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	parent := s.lifecycleCtx
+	if parent == nil {
+		// Tolerate zero-value Server instances (e.g. constructed directly in tests).
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	_, err := server.Up(ctx)
@@ -355,13 +380,30 @@ func (s *Server) GetServiceServer(serviceName string) tsnetpkg.TSNetServer {
 	return s.serviceServers[serviceName]
 }
 
-// Close shuts down the server and all service servers
+// Close shuts down the server and all service servers.
+//
+// Close is idempotent: subsequent calls return nil without touching any
+// resource. After Close returns, Listen always returns ErrServerClosed.
 func (s *Server) Close() error {
+	// Cancel pending startups BEFORE taking the lock: an in-flight Listen
+	// holds mu while blocked in Up(), so cancelling the lifecycle under mu
+	// would deadlock. cancel is idempotent and safe to race with Listen.
+	if s.lifecycleCancel != nil {
+		s.lifecycleCancel()
+	}
+
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
 	servers := s.serviceServers
 	s.serviceServers = make(map[string]tsnetpkg.TSNetServer)
 	s.mu.Unlock()
 
+	// Snapshot any server whose Listen finished in the race between the
+	// cancellation above and setting closed; closing the snapshot covers it.
 	var closeErrors []error
 
 	// Close all service servers with timeout
